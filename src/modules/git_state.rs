@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use super::{Context, Module, ModuleConfig};
 use crate::configs::git_state::GitStateConfig;
-use crate::context::Repo;
+use crate::context::git::Repo;
 use crate::formatter::StringFormatter;
 
 /// Creates a module with the state of the git repository at the current directory
@@ -14,7 +14,7 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
     let mut module = context.new_module("git_state");
     let config: GitStateConfig = GitStateConfig::try_load(module.config);
 
-    let repo = context.get_repo().ok()?;
+    let repo = context.get_git_repo().ok()?;
 
     let state_description = get_state_description(repo, &config)?;
 

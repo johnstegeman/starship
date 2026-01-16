@@ -24,7 +24,7 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
         return None;
     }
 
-    let repo = context.get_repo().ok()?;
+    let repo = context.get_git_repo().ok()?;
     let gix_repo = repo.open();
     if gix_repo.is_bare() {
         return None;

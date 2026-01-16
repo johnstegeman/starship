@@ -1,8 +1,9 @@
 use super::{Context, Module, ModuleConfig};
 use crate::configs::git_status::GitStatusConfig;
+use crate::context::git::Repo;
 use crate::formatter::StringFormatter;
 use crate::segment::Segment;
-use crate::{context, num_configured_starship_threads, num_rayon_threads};
+use crate::{num_configured_starship_threads, num_rayon_threads};
 use gix::bstr::ByteVec;
 use gix::status::Submodule;
 use regex::Regex;
@@ -33,7 +34,7 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
     let config: GitStatusConfig = GitStatusConfig::try_load(module.config);
 
     // Return None if not in git repository
-    let repo = context.get_repo().ok()?;
+    let repo = context.get_git_repo().ok()?;
 
     if repo.kind.is_bare() {
         log::debug!("This is a bare repository, git_status is not applicable");
@@ -191,18 +192,14 @@ pub fn module<'a>(context: &'a Context) -> Option<Module<'a>> {
 
 struct GitStatusInfo<'a> {
     context: &'a Context<'a>,
-    repo: &'a context::Repo,
+    repo: &'a Repo,
     config: GitStatusConfig<'a>,
     repo_status: OnceLock<Option<Arc<RepoStatus>>>,
     stashed_count: OnceLock<Option<usize>>,
 }
 
 impl<'a> GitStatusInfo<'a> {
-    pub fn load(
-        context: &'a Context,
-        repo: &'a context::Repo,
-        config: GitStatusConfig<'a>,
-    ) -> Self {
+    pub fn load(context: &'a Context, repo: &'a Repo, config: GitStatusConfig<'a>) -> Self {
         Self {
             context,
             repo,
@@ -304,7 +301,7 @@ impl<'a> GitStatusInfo<'a> {
 /// The trashing is only expected when tests run though, as otherwise one path is used with a variety of modules.
 pub(crate) fn get_static_repo_status(
     context: &Context,
-    repo: &context::Repo,
+    repo: &Repo,
     config: &GitStatusConfig,
 ) -> Option<Arc<RepoStatus>> {
     static REPO_STATUS: parking_lot::Mutex<Option<(Arc<RepoStatus>, PathBuf)>> =
@@ -327,11 +324,7 @@ pub(crate) fn uses_reftables(repo: &gix::Repository) -> bool {
 }
 
 /// Gets the number of files in various git states (staged, modified, deleted, etc...)
-fn get_repo_status(
-    context: &Context,
-    repo: &context::Repo,
-    config: &GitStatusConfig,
-) -> Option<RepoStatus> {
+fn get_repo_status(context: &Context, repo: &Repo, config: &GitStatusConfig) -> Option<RepoStatus> {
     log::debug!("New repo status created");
 
     let mut repo_status = RepoStatus::default();
@@ -576,7 +569,7 @@ fn sanitize_rename_tracking(mut config: gix::diff::Rewrites) -> gix::diff::Rewri
     config
 }
 
-fn get_stashed_count(repo: &context::Repo) -> Option<usize> {
+fn get_stashed_count(repo: &Repo) -> Option<usize> {
     let repo = repo.open();
     let reference = match repo.try_find_reference("refs/stash") {
         // Only proceed if the found reference has the expected name (not tags/refs/stash etc.)

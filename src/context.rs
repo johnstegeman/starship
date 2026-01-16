@@ -7,12 +7,6 @@ use crate::utils::{CommandOutput, PathExt, create_command, exec_timeout, read_fi
 use crate::modules;
 use crate::utils;
 use clap::Parser;
-use gix::{
-    Repository, ThreadSafeRepository,
-    repository::Kind,
-    sec::{self as git_sec, trust::DefaultForLevel},
-    state as git_state,
-};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -29,6 +23,10 @@ use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use terminal_size::terminal_size;
+
+pub mod git;
+
+pub mod jj;
 
 /// Context contains data or common methods that may be used by multiple modules.
 /// The data contained within Context will be relevant to this particular rendering
@@ -52,7 +50,10 @@ pub struct Context<'a> {
     pub properties: Properties,
 
     /// Private field to store Git information for modules who need it
-    repo: OnceLock<Result<Repo, Box<gix::discover::Error>>>,
+    git_repo: OnceLock<Result<git::Repo, Box<gix::discover::Error>>>,
+
+    /// Private field to store JJ information for modules who need it
+    jj_repo: OnceLock<Option<jj::Repo>>,
 
     /// The shell the user is assumed to be running
     pub shell: Shell,
@@ -169,7 +170,8 @@ impl<'a> Context<'a> {
             current_dir,
             logical_dir,
             dir_contents: OnceLock::new(),
-            repo: OnceLock::new(),
+            git_repo: OnceLock::new(),
+            jj_repo: OnceLock::new(),
             shell,
             target,
             width,
@@ -310,82 +312,18 @@ impl<'a> Context<'a> {
     }
 
     /// Will lazily get repo root and branch when a module requests it.
-    pub fn get_repo(&self) -> Result<&Repo, &gix::discover::Error> {
-        self.repo
-            .get_or_init(|| -> Result<Repo, Box<gix::discover::Error>> {
-                // custom open options
-                let mut git_open_opts_map =
-                    git_sec::trust::Mapping::<gix::open::Options>::default();
-
-                // Load all the configuration as it affects aspects of the
-                // `git_status` and `git_metrics` modules.
-                let config = gix::open::permissions::Config {
-                    git_binary: true,
-                    system: true,
-                    git: true,
-                    user: true,
-                    env: true,
-                    includes: true,
-                };
-                // change options for config permissions without touching anything else
-                git_open_opts_map.reduced =
-                    git_open_opts_map
-                        .reduced
-                        .permissions(gix::open::Permissions {
-                            config,
-                            ..gix::open::Permissions::default_for_level(git_sec::Trust::Reduced)
-                        });
-                git_open_opts_map.full =
-                    git_open_opts_map.full.permissions(gix::open::Permissions {
-                        config,
-                        ..gix::open::Permissions::default_for_level(git_sec::Trust::Full)
-                    });
-
-                let shared_repo =
-                    match ThreadSafeRepository::discover_with_environment_overrides_opts(
-                        &self.current_dir,
-                        gix::discover::upwards::Options {
-                            match_ceiling_dir_or_error: false,
-                            ..Default::default()
-                        },
-                        git_open_opts_map,
-                    ) {
-                        Ok(repo) => repo,
-                        Err(e) => {
-                            log::debug!("Failed to find git repo: {e}");
-                            return Err(Box::new(e));
-                        }
-                    };
-
-                let repository = shared_repo.to_thread_local();
-                log::trace!(
-                    "Found git repo: {repository:?}, (trust: {:?})",
-                    repository.git_dir_trust()
-                );
-
-                let branch = get_current_branch(&repository);
-                let remote =
-                    get_remote_repository_info(&repository, branch.as_ref().map(AsRef::as_ref));
-                let path = repository.path().to_path_buf();
-
-                let fs_monitor_value_is_true = repository
-                    .config_snapshot()
-                    .boolean("core.fsmonitor")
-                    .unwrap_or(false);
-
-                Ok(Repo {
-                    repo: shared_repo,
-                    branch: branch.map(|b| b.shorten().to_string()),
-                    workdir: repository.workdir().map(PathBuf::from),
-                    path,
-                    state: repository.state(),
-                    remote,
-                    fs_monitor_value_is_true,
-                    kind: repository.kind(),
-                })
-            })
+    pub fn get_git_repo(&self) -> Result<&git::Repo, &gix::discover::Error> {
+        self.git_repo
+            .get_or_init(|| git::init_repo(&self.current_dir))
             .as_ref()
-            .map_err(std::convert::AsRef::as_ref)
+            .map_err(AsRef::as_ref)
+    }
+
+    /// Will lazily get repository when a module requests it.
+    pub fn get_jj_repo(&self) -> Option<&jj::Repo> {
+        self.jj_repo
+            .get_or_init(|| jj::init_repo(&self.current_dir))
+            .as_ref()
     }
 
     pub fn dir_contents(&self) -> Result<&DirContents, &std::io::Error> {
@@ -703,89 +641,6 @@ impl DirContents {
     }
 }
 
-pub struct Repo {
-    pub repo: ThreadSafeRepository,
-
-    /// If `current_dir` is a git repository or is contained within one,
-    /// this is the short name of the current branch name of that repo,
-    /// i.e. `main`.
-    pub branch: Option<String>,
-
-    /// If `current_dir` is a git repository or is contained within one,
-    /// this is the path to the root of that repo.
-    pub workdir: Option<PathBuf>,
-
-    /// The path of the repository's `.git` directory.
-    pub path: PathBuf,
-
-    /// State
-    pub state: Option<git_state::InProgress>,
-
-    /// Remote repository
-    pub remote: Option<Remote>,
-
-    /// Contains `true` if the value of `core.fsmonitor` is set to `true`.
-    /// If not `true`, `fsmonitor` is explicitly disabled in git commands.
-    pub(crate) fs_monitor_value_is_true: bool,
-
-    // Kind of repository, work tree or bare
-    pub kind: Kind,
-}
-
-impl Repo {
-    /// Opens the associated git repository.
-    pub fn open(&self) -> Repository {
-        self.repo.to_thread_local()
-    }
-
-    /// Wrapper to execute external git commands.
-    /// Handles adding the appropriate `--git-dir` and `--work-tree` flags to the command.
-    /// Also handles additional features required for security, such as disabling `fsmonitor`.
-    /// At this time, mocking is not supported.
-    pub fn exec_git<T: AsRef<OsStr> + Debug>(
-        &self,
-        context: &Context,
-        git_args: impl IntoIterator<Item = T>,
-    ) -> Option<CommandOutput> {
-        let mut command = create_command("git").ok()?;
-
-        // A value of `true` should not execute external commands.
-        let fsm_config_value = if self.fs_monitor_value_is_true {
-            "core.fsmonitor=true"
-        } else {
-            "core.fsmonitor="
-        };
-
-        command.env("GIT_OPTIONAL_LOCKS", "0").args([
-            OsStr::new("-C"),
-            context.current_dir.as_os_str(),
-            OsStr::new("--git-dir"),
-            self.path.as_os_str(),
-            OsStr::new("-c"),
-            OsStr::new(fsm_config_value),
-        ]);
-
-        // Bare repositories might not have a workdir, so we need to check for that.
-        if let Some(wt) = self.workdir.as_ref() {
-            command.args([OsStr::new("--work-tree"), wt.as_os_str()]);
-        }
-
-        command.args(git_args);
-        log::trace!("Executing git command: {command:?}");
-
-        exec_timeout(
-            &mut command,
-            Duration::from_millis(context.root_config.command_timeout),
-        )
-    }
-}
-
-/// Remote repository
-pub struct Remote {
-    pub branch: Option<String>,
-    pub name: Option<String>,
-}
-
 // A struct of Criteria which will be used to verify current PathBuf is
 // of X language, criteria can be set via the builder pattern
 pub struct ScanDir<'a> {
@@ -823,10 +678,10 @@ impl<'a> ScanDir<'a> {
             && self.dir_contents.has_no_negative_file_name(self.files)
             && self.dir_contents.has_no_negative_folder(self.folders)
             && (self
-                .dir_contents
-                .has_any_positive_extension(self.extensions)
-                || self.dir_contents.has_any_positive_file_name(self.files)
-                || self.dir_contents.has_any_positive_folder(self.folders))
+            .dir_contents
+            .has_any_positive_extension(self.extensions)
+            || self.dir_contents.has_any_positive_file_name(self.files)
+            || self.dir_contents.has_any_positive_folder(self.folders))
     }
 }
 
@@ -904,26 +759,6 @@ impl<'a> ScanAncestors<'a> {
 
         None
     }
-}
-
-fn get_current_branch(repository: &Repository) -> Option<gix::refs::FullName> {
-    repository.head_name().ok()?
-}
-
-fn get_remote_repository_info(
-    repository: &Repository,
-    branch_name: Option<&gix::refs::FullNameRef>,
-) -> Option<Remote> {
-    let branch_name = branch_name?;
-    let branch = repository
-        .branch_remote_ref_name(branch_name, gix::remote::Direction::Fetch)
-        .and_then(std::result::Result::ok)
-        .map(|r| r.shorten().to_string());
-    let name = repository
-        .branch_remote_name(branch_name.shorten(), gix::remote::Direction::Fetch)
-        .map(|n| n.as_bstr().to_string());
-
-    Some(Remote { branch, name })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1061,7 +896,7 @@ mod tests {
                 extensions: &[],
                 folders: &[],
             }
-            .is_match()
+                .is_match()
         );
 
         assert!(
@@ -1071,7 +906,7 @@ mod tests {
                 extensions: &[],
                 folders: &["link_to_folder"],
             }
-            .is_match()
+                .is_match()
         );
 
         let dc_not_following_symlinks = DirContents::from_path(d.path(), false)?;
@@ -1083,7 +918,7 @@ mod tests {
                 extensions: &[],
                 folders: &[],
             }
-            .is_match()
+                .is_match()
         );
 
         assert!(
@@ -1093,7 +928,7 @@ mod tests {
                 extensions: &[],
                 folders: &["link_to_folder"],
             }
-            .is_match()
+                .is_match()
         );
 
         Ok(())
@@ -1112,7 +947,7 @@ mod tests {
                 extensions: &["js"],
                 folders: &["node_modules"],
             }
-            .is_match()
+                .is_match()
         );
         empty.close()?;
 
@@ -1125,7 +960,7 @@ mod tests {
                 extensions: &["js"],
                 folders: &["node_modules"],
             }
-            .is_match()
+                .is_match()
         );
         rust.close()?;
 
@@ -1138,7 +973,7 @@ mod tests {
                 extensions: &["js"],
                 folders: &["node_modules"],
             }
-            .is_match()
+                .is_match()
         );
         java.close()?;
 
@@ -1151,7 +986,7 @@ mod tests {
                 extensions: &["js"],
                 folders: &["node_modules"],
             }
-            .is_match()
+                .is_match()
         );
         node.close()?;
 
@@ -1164,7 +999,7 @@ mod tests {
                 extensions: &["tar.gz"],
                 folders: &[],
             }
-            .is_match()
+                .is_match()
         );
         tarballs.close()?;
 
@@ -1177,7 +1012,7 @@ mod tests {
                 extensions: &["js", "!notfound", "!ts"],
                 folders: &[],
             }
-            .is_match()
+                .is_match()
         );
         dont_match_ext.close()?;
 
@@ -1190,7 +1025,7 @@ mod tests {
                 extensions: &[],
                 folders: &[],
             }
-            .is_match()
+                .is_match()
         );
         dont_match_file.close()?;
 
@@ -1204,7 +1039,7 @@ mod tests {
                 extensions: &[],
                 folders: &["gooddir", "!notfound", "!evildir"],
             }
-            .is_match()
+                .is_match()
         );
         dont_match_folder.close()?;
 
@@ -1225,7 +1060,7 @@ mod tests {
                 extensions: &["js"],
                 folders: &["node_modules"],
             }
-            .is_match()
+                .is_match()
         );
         empty.close()?;
 
@@ -1238,7 +1073,7 @@ mod tests {
                 extensions: &["js"],
                 folders: &["node_modules"],
             }
-            .is_match()
+                .is_match()
         );
         rust.close()?;
 
