@@ -322,7 +322,7 @@ impl<'a> Context<'a> {
     /// Will lazily get repository when a module requests it.
     pub fn get_jj_repo(&self) -> Option<&jj::Repo> {
         self.jj_repo
-            .get_or_init(|| jj::init_repo(&self.current_dir))
+            .get_or_init(|| jj::init_repo(&self, &self.current_dir))
             .as_ref()
     }
 
