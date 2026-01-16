@@ -1,7 +1,6 @@
 use crate::context::Context;
 use std::time::Duration;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::ffi::OsStr;
 use std::fmt::Debug;
 use crate::utils::{CommandOutput, create_command, exec_timeout};
@@ -14,12 +13,12 @@ pub struct Repo {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub(crate) struct JjClosestBookmarksInfo {
+pub struct JjClosestBookmarksInfo {
     pub bookmarks: Vec<BookmarkInfo>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub(crate) struct BookmarkInfo {
+pub struct BookmarkInfo {
     pub name: String,
     pub remote_ahead: usize,
     pub remote_behind: usize,

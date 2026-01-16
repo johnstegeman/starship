@@ -2,7 +2,6 @@ use super::{Context, Module, ModuleConfig};
 
 use crate::configs::jujutsu_closest_bookmarks::JujutsuClosestBookmarksConfig;
 use crate::formatter::StringFormatter;
-use crate::modules::utils::jujutsu::get_closest_jujutsu_bookmarks_info;
 use crate::modules::vcs;
 
 /// Creates a module with the Jujutsu bookmarks in the current directory
